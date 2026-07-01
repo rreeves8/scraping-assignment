@@ -1,4 +1,6 @@
-# Trial court scraper for the los angeles [case record system](https://www.lacourt.ca.gov/). 
+# Trial court scraper task
+
+You are tasked with build a scraper for the los angeles [case record system](https://www.lacourt.ca.gov/). 
 
 Based on my investigation the following can be done:
 - Enumerate through predictable case numbers     

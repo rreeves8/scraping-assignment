@@ -9,6 +9,8 @@ type InsertCase = Callable[[ScrapedTrialCase], Awaitable[None]]
 class TrialScraper:
     scraper_id: str
     court_id: str
+    
+
 
     def __init__(self, to_date: date, from_date: date) -> None:
         self.to_date = to_date

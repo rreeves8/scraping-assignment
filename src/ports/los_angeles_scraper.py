@@ -19,10 +19,11 @@ import io
 import os
 import re
 import zipfile
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from datetime import date, datetime
 from urllib.parse import quote
 
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -80,27 +81,45 @@ class LosAngelesScraper(TrialScraper):
         # Runtime knobs (see README), read once here. Small, bounded run by
         # default: prove the pipeline on one or two real cases rather than
         # sweep thousands of empty sequence numbers.
-        # TODO: env read here (not entry.py) because the pipeline's scraper
-        # constructor is fixed; centralize if that interface gains a config slot.
         raw = os.environ.get("LA_CASE_NUMBERS", "")
         self.case_numbers = [c.strip() for c in raw.split(",") if c.strip()]
         self.max_cases = int(os.environ.get("LA_MAX_CASES", "1"))
         self.max_docs = int(os.environ.get("LA_MAX_DOCS", "5"))
+        self.concurrency = int(os.environ.get("LA_CONCURRENCY", "2"))
+        self._attempted = 0
+        self._scraped = 0
 
     async def scrape(self, insert_case: InsertCase) -> None:
+        # No point opening more sessions than explicit case numbers to search.
+        workers = min(self.concurrency, len(self.case_numbers) or self.concurrency)
         print(
             f"[los_angeles] starting — up to {self.max_cases} case(s), "
-            f"{self.max_docs} doc(s) each; opening browser…"
+            f"{self.max_docs} doc(s) each; opening {workers} browser session(s)…"
         )
+        case_iter = iter(self._target_case_numbers())
+        results = await asyncio.gather(
+            *(self._worker(case_iter, insert_case) for _ in range(workers)),
+            return_exceptions=True,  # one dead session must not kill the rest
+        )
+        for exc in results:
+            if isinstance(exc, BaseException):
+                print(f"[los_angeles] worker died: {exc!r}")
+        print(
+            f"[los_angeles] done: scraped {self._scraped} of "
+            f"{self._attempted} case(s) tried"
+        )
+
+    async def _worker(self, case_iter: Iterator[str], insert_case: InsertCase) -> None:
+        """One Browserbase session pulling case numbers off the shared iterator
+        until the quota is filled or the numbers run out. Sharing a plain
+        iterator between workers is safe: next() has no await point."""
         bb = self.browser.new_browser_base()
-        attempted = 0
-        scraped = 0
         async with bb as (_session, page):
             await self._continue_as_guest(page)
-            for case_number in self._target_case_numbers():
-                if scraped >= self.max_cases:
-                    break
-                attempted += 1
+            for case_number in case_iter:
+                if self._scraped >= self.max_cases:
+                    return
+                self._attempted += 1
                 try:
                     case = await self._scrape_case(page, bb, case_number)
                 except Exception as exc:  # one bad case must not kill the sweep
@@ -108,9 +127,10 @@ class LosAngelesScraper(TrialScraper):
                     continue
                 if case is None:
                     continue
+                if self._scraped >= self.max_cases:
+                    return  # another worker filled the quota mid-flight
+                self._scraped += 1
                 await insert_case(case)
-                scraped += 1
-        print(f"[los_angeles] done: scraped {scraped} of {attempted} case(s) tried")
 
     def _target_case_numbers(self) -> Iterable[str]:
         return self.case_numbers or generate_case_numbers(self.from_date, self.to_date)
@@ -154,19 +174,33 @@ class LosAngelesScraper(TrialScraper):
             return None  # case not found or has no imaged documents
         html = await page.content()  # page 1 carries the case metadata
 
-        docs = await self._collect_all_documents(page, docs)
+        docs = await _collect_all_documents(page, docs, self.max_docs)
         selected = docs[: self.max_docs]
         print(
             f"[{case_number}] {len(docs)} document(s) found; "
             f"downloading {len(selected)}"
         )
 
-        documents: list[ScrapedTrialDocument] = []
-        for i, d in enumerate(selected, 1):
+        # Each doc gets its own tab so the captcha-gated previews run
+        # concurrently; all downloads land in the same session storage and are
+        # matched back by docId. The search page stays untouched on `page`.
+        async def fetch(i: int, d: dict[str, str]) -> bytes | None:
             print(
                 f"  [{case_number}] downloading {i}/{len(selected)}: {d['description']}"
             )
-            raw = await self._download_document(page, bb, d)
+            tab = await page.context.new_page()
+            try:
+                return await self._download_document(tab, bb, d)
+            except Exception as exc:  # one failed doc must not sink its siblings
+                print(f"  [{case_number}] doc {d['docId']} failed: {exc!r}")
+                return None
+            finally:
+                await tab.close()
+
+        raws = await asyncio.gather(*(fetch(i, d) for i, d in enumerate(selected, 1)))
+
+        documents: list[ScrapedTrialDocument] = []
+        for d, raw in zip(selected, raws):
             if raw is None:
                 print(f"  [{case_number}] doc {d['docId']} not captured, skipping")
                 continue
@@ -196,28 +230,6 @@ class LosAngelesScraper(TrialScraper):
             html=html,
             document_list=documents,
         )
-
-    async def _collect_all_documents(
-        self, page: Page, docs: list[dict[str, str]]
-    ) -> list[dict[str, str]]:
-        """Walk the results pager, appending each page's documents until we
-        have enough for max_docs or run out of pages. Results hold 50 docs per
-        page; page 1 is already in ``docs``, further pages are at
-        SelectDocuments?page=N (the case is held in the session)."""
-        current = 1
-        while len(docs) < self.max_docs:
-            page_numbers = await page.evaluate(_PAGE_LINKS)
-            if current + 1 not in page_numbers:
-                break  # no next page
-            current += 1
-            await page.goto(
-                f"{BASE}/DocumentImages/SelectDocuments?page={current}",
-                wait_until="domcontentloaded",
-                timeout=90000,
-            )
-            await page.wait_for_timeout(2500)
-            docs += await page.evaluate(_EXTRACT_DOCS)
-        return docs
 
     async def _download_document(
         self, page: Page, bb: BrowserBase, doc: dict[str, str]
@@ -257,12 +269,37 @@ class LosAngelesScraper(TrialScraper):
                     await page.goto(
                         preview_url, wait_until="domcontentloaded", timeout=120000
                     )
-                except Exception:
+                except PlaywrightError:
                     pass  # navigation aborts when the download begins
-            await page.wait_for_timeout(3000)  # let Browserbase sync it
             return True
         except PlaywrightTimeoutError:
             return False
+
+
+async def _collect_all_documents(
+    page: Page, docs: list[dict[str, str]], max_docs: int
+) -> list[dict[str, str]]:
+    """Walk the results pager, returning page 1's ``docs`` plus each further
+    page's documents until we have enough for max_docs or run out of pages.
+    Results hold 50 docs per page; further pages are at
+    SelectDocuments?page=N (the case is held in the session)."""
+    docs = list(docs)
+    current = 1
+    while len(docs) < max_docs:
+        page_numbers = await page.evaluate(_PAGE_LINKS)
+        if current + 1 not in page_numbers:
+            break  # no next page
+        current += 1
+        await page.goto(
+            f"{BASE}/DocumentImages/SelectDocuments?page={current}",
+            wait_until="domcontentloaded",
+            timeout=90000,
+        )
+        # Every further page has doc rows, so wait for one instead of a blind
+        # sleep — a slow page must not silently truncate the document list.
+        await page.wait_for_selector("input[type=checkbox][id^='Doc']", timeout=30000)
+        docs += await page.evaluate(_EXTRACT_DOCS)
+    return docs
 
 
 def _pdfs_by_doc_id(zip_bytes: bytes) -> dict[str, bytes]:

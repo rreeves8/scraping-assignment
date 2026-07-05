@@ -39,6 +39,9 @@ Optional env knobs:
   numbers from `00001` and most are empty.
 - `LA_MAX_CASES` — stop after this many cases yield documents (default `1`).
 - `LA_MAX_DOCS` — documents downloaded per case (default `5`).
+- `LA_CONCURRENCY` — parallel Browserbase sessions, each working its own case
+  numbers (default `2`). Within a case, documents download concurrently in
+  separate tabs regardless of this setting.
 
 ## How it works
 

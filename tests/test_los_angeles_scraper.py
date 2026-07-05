@@ -1,15 +1,18 @@
 """Checks for the pure parsing/mapping helpers (no network)."""
 
-# pyright: reportPrivateUsage=false, reportArgumentType=false
+# pyright: reportPrivateUsage=false
 
 import asyncio
 import io
 import zipfile
-from datetime import date, datetime
+from datetime import datetime
+from typing import cast
+
+from playwright.async_api import Page
 
 from src.ports.los_angeles_scraper import (
-    LosAngelesScraper,
     _case_meta,
+    _collect_all_documents,
     _doc_id_in,
     _is_opinion,
     _parse_date,
@@ -103,33 +106,39 @@ class _FakePage:
     async def goto(self, url: str, **_: object) -> None:
         self.current = int(url.split("page=")[1])
 
-    async def wait_for_timeout(self, _ms: int) -> None:
+    async def wait_for_selector(self, _selector: str, **_: object) -> None:
         pass
 
 
-def _scraper(max_docs: int) -> LosAngelesScraper:
-    s = LosAngelesScraper(date(2019, 12, 31), date(2019, 1, 1), browser=None)
-    s.max_docs = max_docs
-    return s
+def _collect(page: _FakePage, max_docs: int) -> list[dict[str, str]]:
+    return asyncio.run(
+        _collect_all_documents(cast(Page, page), page.pages[0], max_docs)
+    )
 
 
 def test_paging_walks_all_pages_when_wanted():
     page = _FakePage(total_docs=116)  # 3 pages: 50 + 50 + 16
-    docs = asyncio.run(_scraper(1000)._collect_all_documents(page, page.pages[0][:]))
+    docs = _collect(page, max_docs=1000)
     assert len(docs) == 116
     assert len({d["docId"] for d in docs}) == 116  # no duplicates across pages
 
 
 def test_paging_stops_early_at_max_docs():
     page = _FakePage(total_docs=200)
-    docs = asyncio.run(_scraper(5)._collect_all_documents(page, page.pages[0][:]))
+    docs = _collect(page, max_docs=5)
     assert len(docs) == 50  # page 1 already satisfies max_docs; no extra pages
     assert page.current == 1
 
 
+def test_paging_does_not_mutate_page_one_list():
+    page = _FakePage(total_docs=116)
+    _collect(page, max_docs=1000)
+    assert len(page.pages[0]) == 50  # caller's list untouched
+
+
 def test_paging_single_page_case():
     page = _FakePage(total_docs=20)
-    docs = asyncio.run(_scraper(1000)._collect_all_documents(page, page.pages[0][:]))
+    docs = _collect(page, max_docs=1000)
     assert len(docs) == 20  # no next page; terminates cleanly
 
 

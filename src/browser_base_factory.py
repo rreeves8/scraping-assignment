@@ -35,12 +35,29 @@ class BrowserBase:
             self._browser = await self._pw.chromium.connect_over_cdp(
                 self._bb_session.connect_url
             )
+            # Route browser downloads into Browserbase storage so they can be
+            # pulled back with get_downloads(). downloadPath must be "downloads".
+            cdp = await self._browser.new_browser_cdp_session()
+            await cdp.send(  # pyright: ignore[reportUnknownMemberType]
+                "Browser.setDownloadBehavior",
+                {
+                    "behavior": "allow",
+                    "downloadPath": "downloads",
+                    "eventsEnabled": True,
+                },
+            )
             context = self._browser.contexts[0]
             page = context.pages[0]
             return self._bb_session, page
-        except:
+        except BaseException:
             await self._take_down()
             raise
+
+    async def get_downloads(self) -> bytes:
+        """Zip archive of every file downloaded during this session (or b'')."""
+        assert self._bb_session is not None
+        resp = await self._bb.sessions.downloads.list(self._bb_session.id)
+        return await resp.read()
 
     async def __aexit__(self, *_: object) -> None:
         await self._take_down()

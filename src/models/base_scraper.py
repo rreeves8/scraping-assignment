@@ -18,4 +18,5 @@ class TrialScraper:
         self.from_date = from_date
         self.browser = browser
 
-    async def scrape(self, insert_case: InsertCase): ...
+    async def scrape(self, insert_case: InsertCase) -> None:
+        raise NotImplementedError

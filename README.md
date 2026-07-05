@@ -15,3 +15,42 @@ You have access to a browser base account that does the following:
 - Connect and use it through the factory and playwight
 
 The code can be ran using `uv run scraper`
+
+## Usage
+
+Put your Browserbase credentials in `.env`:
+
+```ini
+BROWSERBASE_API_KEY=...
+BROWSERBASE_PROJECT_ID=...
+```
+
+Run against a date range (the 2-digit year in a case number is derived from it):
+
+```bash
+uv run scraper --from-date 2019-01-01 --to-date 2019-12-31
+```
+
+Optional env knobs:
+
+- `LA_CASE_NUMBERS` — comma-separated case numbers to scrape directly, bypassing
+  enumeration (e.g. `LA_CASE_NUMBERS=19STCV12345`, a verified case with imaged
+  documents). Recommended for a quick demo: the default sweep probes sequence
+  numbers from `00001` and most are empty.
+- `LA_MAX_CASES` — stop after this many cases yield documents (default `1`).
+- `LA_MAX_DOCS` — documents downloaded per case (default `5`).
+
+## How it works
+
+1. `GuestInformation` sets a guest session cookie.
+2. `SearchCaseNumber` is POSTed a case number and returns the document list
+   (date, description, and a per-document `securityKey`). Results hold 50 docs
+   per page; extra pages are walked via `SelectDocuments?page=N`.
+3. Each document's `PreviewWait` page is reCAPTCHA-gated — Browserbase solves it
+   automatically, then the browser downloads the one-time PDF URL.
+4. Browserbase captures the download; the PDF bytes are pulled back via its
+   downloads API and matched to each document by the docId in the filename.
+
+Case numbers are constructed in
+[`los_angeles_case_numbers.py`](src/ports/los_angeles_case_numbers.py):
+`YY` (year) + district + case type + zero-padded sequence, e.g. `19STCV12345`.

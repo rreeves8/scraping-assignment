@@ -4,6 +4,7 @@ import os
 from datetime import date
 
 from dotenv import load_dotenv
+
 from .application.scraping_pipeline import (
     ScrapingPipelineDeps,
     create_scraping_pipeline,
@@ -11,25 +12,12 @@ from .application.scraping_pipeline import (
 from .browser_base_factory import BrowserBaseFactory
 from .ports import LosAngelesScraper
 
-load_dotenv()
-
 
 def require_env(k: str) -> str:
     v = os.environ.get(k)
     if not v:
         raise ValueError(f"missing environment var: {k}")
     return v
-
-
-pipeline = create_scraping_pipeline(
-    deps=ScrapingPipelineDeps(
-        browser_base=BrowserBaseFactory(
-            project_id=require_env("BROWSERBASE_PROJECT_ID"),
-            api_key=require_env("BROWSERBASE_API_KEY"),
-        ),
-        scrapers=[LosAngelesScraper],
-    )
-)
 
 
 def main():
@@ -42,4 +30,14 @@ def main():
     )
     args = parser.parse_args()
 
+    load_dotenv()
+    pipeline = create_scraping_pipeline(
+        deps=ScrapingPipelineDeps(
+            browser_base=BrowserBaseFactory(
+                project_id=require_env("BROWSERBASE_PROJECT_ID"),
+                api_key=require_env("BROWSERBASE_API_KEY"),
+            ),
+            scrapers=[LosAngelesScraper],
+        )
+    )
     asyncio.run(pipeline(to_date=args.to_date, from_date=args.from_date))

@@ -133,23 +133,29 @@ captchas as busy and as correct as possible.
 ```
 src/
   entry.py                       CLI: parse dates, load env, wire deps, run.
-  browser_base_factory.py        Owns a Browserbase session + Playwright browser.
+  browser_base_factory.py        Browser adapter: owns a Browserbase session.
+  case_store.py                  Persistence adapter: writes results to JSON.
   application/
-    scraping_pipeline.py         Runs scrapers, saves results to JSON.
+    scraping_pipeline.py         Use case: run scrapers → store. Orchestration only.
   ports/
     los_angeles_scraper.py       The scraper: probe → paginate → download.
     los_angeles_case_numbers.py  Builds candidate case numbers.
   models/                        Dataclasses for cases/documents + TrialScraper.
 tests/
   test_los_angeles_scraper.py    Pure-function unit tests (no network).
+  test_case_store.py             Persistence adapter tests (temp dir, no network).
 ```
 
 This is a light **ports-and-adapters** layout. `application/` orchestrates and
-knows nothing about LA; `ports/` holds the court-specific adapter; `models/`
-holds the shared types. A second court would be a new file under `ports/`
-implementing the same `TrialScraper`, reusing the pipeline and models unchanged.
-We didn't build any second-court machinery — there's one court — but the seam is
-kept because that's where a real system would grow.
+knows nothing about LA; `ports/` holds the court-specific scraper; `models/`
+holds the shared types. The two **adapters at the `src/` root** are shared
+infrastructure the use case drives but doesn't contain: `browser_base_factory`
+(talks to Browserbase) and `case_store` (talks to the filesystem). Keeping both
+out of `application/` is what lets the pipeline read as pure orchestration —
+"for each scraper, run it, feed results to the store" — with no I/O detail. A
+second court would be a new file under `ports/`, reusing the pipeline, store, and
+models unchanged. We didn't build any second-court machinery — there's one court
+— but the seam is kept because that's where a real system would grow.
 
 ### Why the factory moved out of `ports/`
 
@@ -270,9 +276,22 @@ slot for good).
 
 ---
 
-## 6. Persistence (`scraping_pipeline.py`)
+## 6. Persistence (`case_store.py`)
 
-`insert_case` appends to a JSON array in `cases.json` (commit `c30ca7c`):
+Persistence lives in its own adapter, `CaseStore`, **not** in the pipeline. The
+pipeline just news up one store per run and hands the scraper its
+`insert_case` / `record_failure` methods — those bound methods *are* the
+`InsertCase` / `RecordFailure` sinks (§9's ports). This is the same reasoning
+that moved the browser factory out of `ports/` (§3): filesystem I/O is
+infrastructure, so it sits beside `browser_base_factory` at the `src/` root, and
+the use case stays free of it. A bonus of the extraction: the store takes its
+file paths as constructor arguments, so tests point it at a temp dir — the
+testability we'd otherwise have lost by hardcoding `cases.json`.
+
+It writes two JSON files, both through the same atomic-write helper: `cases.json`
+for successes and `failures.json` for things it couldn't capture.
+
+**`cases.json`** — `insert_case` appends each scraped case (commit `c30ca7c`):
 
 - **Metadata only — no PDF bytes, no page HTML.** Each document keeps its
   `content_hash` and `size_bytes`, so a record stays verifiable and dedupable
@@ -282,6 +301,27 @@ slot for good).
   read-modify-write is serialized with an `asyncio.Lock` and the file is written
   to `.tmp` then renamed — a crash can't leave a half-written DB. This is the one
   place workers share external state, so it's the one place that needs the care.
+
+**`failures.json`** — `record_failure` appends anything found but not captured,
+so a later run can retry it instead of the failure vanishing into the logs. Two
+kinds land here:
+
+- **A document that couldn't be downloaded** (preview never started even after
+  the resubmit, or an unreadable docket date). The record spreads the whole
+  document row — `docId`, `securityKey`, description, date — everything a retry
+  needs.
+- **A case that was confirmed to have documents but whose scrape crashed**
+  mid-way. Recorded at the case level so the whole case can be re-run.
+
+It uses the same lock and atomic-write helper as `cases.json` — failures are
+just the other half of the same persistence concern, not a separate mechanism.
+Scoping note: a probe that *errored* (a search that failed even after its retry)
+is **not** recorded — those cases were never confirmed to have documents, and in
+a big enumeration sweep transient probe errors would flood the file with case
+numbers that may not even exist. Only confirmed-real work that failed is kept.
+To retry, feed the failed case numbers back in via `LA_CASE_NUMBERS` (a future
+run re-searches them for fresh keys, then re-downloads). Auto-consuming
+`failures.json` is deliberately not built — [§12](#12-what-we-deliberately-didnt-build).
 
 ---
 
@@ -478,12 +518,15 @@ hung close can't wedge the run. Worth noting:
 
 ## 11. Testing
 
-The tests are **pure-function only** — no network, no browser, just a tiny fake
-page for the paging loop. The parts that can silently produce *wrong* output
-(docId parsing, PDF completeness, the paging walk, metadata extraction, date
-parsing, the pool's resubmission) are all pure and cheap to test. The parts that
-need a real browser are checked by **live end-to-end runs** before each perf
-commit. Fast tests guard the tricky logic; the live run guards the integration.
+The tests are **network-free** — no browser, just pure functions plus a tiny
+fake page for the paging loop and a temp dir for the store. The parts that can
+silently produce *wrong* output (docId parsing, PDF completeness, the paging
+walk, metadata extraction, date parsing, the pool's resubmission) are all pure
+and cheap to test. `CaseStore` is tested against a temp directory
+(`test_case_store.py`) — the constructor takes its paths, so a test writes and
+reads real files without touching the repo's `cases.json`. The parts that need a
+real browser are checked by **live end-to-end runs** before each perf commit.
+Fast tests guard the tricky logic; the live run guards the integration.
 
 When the download mechanism changed, the old zip-parsing tests were replaced by
 tests for the new helpers (`_pick_download_files`, `_is_complete_pdf`) rather than
@@ -501,6 +544,10 @@ So the gaps read as intent, not oversight:
   schema (hash + size, no bytes) is already dedup-friendly if a store is added.
 - **No document-type taxonomy.** `_is_opinion` is a keyword heuristic with a
   `TODO`; a real system would map document-type codes.
+- **No auto-retry of `failures.json`.** Failures are *recorded* (§6) but not
+  automatically re-run — a run reads the case iterator, not the failures file.
+  Retrying is a manual `LA_CASE_NUMBERS` re-run; wiring the failures file back in
+  as an input is a clean next step, but building it now would be speculative.
 - **No tuning of `_TABS_PER_SESSION` / `LA_CONCURRENCY`** beyond the measured
   sweet spot. 16 sessions is where throughput peaks (§2.3); higher saturates the
   solver and costs more for less, so the defaults are set there and the knobs are

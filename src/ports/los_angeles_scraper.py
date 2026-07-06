@@ -111,6 +111,12 @@ _OPINION_HINTS = ("opinion", "ruling", "order", "judgment", "minute order")
 # sessions opens hundreds of simultaneous previews and melts down.
 _MAX_CONCURRENT_DOWNLOADS = 24
 
+# Recycle a worker's session after this many downloaded cases: get_downloads()
+# is cumulative per session and re-fetched each confirm, so an unbounded session
+# grows quadratic. Reusing across a few cases still avoids a fresh session (and
+# a re-search) per case, which is what the plan's concurrency budget bottlenecks.
+_RECYCLE_SESSION_EVERY = 8
+
 
 class LosAngelesScraper(TrialScraper):
     scraper_id = "los_angeles"
@@ -159,62 +165,53 @@ class LosAngelesScraper(TrialScraper):
 
     async def _worker(self, case_iter: Iterator[str], insert_case: InsertCase) -> None:
         """Pull case numbers off the shared iterator until the quota is filled
-        or the numbers run out. Probing happens in this worker's long-lived
-        session, where an empty case number costs one fetch round-trip; only a
-        case that has documents is handed to a fresh session for the full
-        scrape (see _scrape_case_in_session for why downloads get their own).
-        Sharing a plain iterator between workers is safe: next() has no await
-        point."""
-        bb = self.browser.new_browser_base()
-        async with bb as (_session, page):
-            await self._continue_as_guest(page)
-            for case_number in case_iter:
-                if self._claimed >= self.max_cases:
-                    return  # quota already claimed (by any worker)
-                self._attempted += 1
-                # Probe cheaply in this shared session first.
-                try:
-                    print(f"[{case_number}] checking for documents…")
-                    docs, _, _ = await self._search(page, case_number)
-                except Exception as exc:  # one bad case must not kill the sweep
-                    print(f"[{case_number}] error, skipping: {exc!r}")
-                    continue
-                if not docs:
-                    print(f"[{case_number}] no documents")
-                    continue
-                # Claim a slot *before* the expensive download-scrape so no
-                # worker downloads a case beyond the quota (avoids paying for
-                # cases that would be discarded at the boundary).
-                if self._claimed >= self.max_cases:
-                    return
-                self._claimed += 1
-                print(
-                    f"[{case_number}] found documents — "
-                    "opening a new browser to download them"
-                )
-                try:
-                    case = await self._scrape_case_in_session(case_number)
-                except Exception as exc:
-                    print(f"[{case_number}] error, skipping: {exc!r}")
-                    self._claimed -= 1  # slot didn't pan out; free it
-                    continue
-                if case is None:
-                    self._claimed -= 1
-                    continue
-                self._scraped += 1
-                await insert_case(case)
-
-    async def _scrape_case_in_session(
-        self, case_number: str
-    ) -> ScrapedTrialCase | None:
-        """Scrape one case in a fresh Browserbase session. A session per case
-        keeps its downloads zip small: get_downloads() is cumulative per
-        session, so reusing one across many cases makes confirming each PDF
-        re-fetch every earlier case's downloads (quadratic)."""
-        bb = self.browser.new_browser_base()
-        async with bb as (_session, page):
-            await self._continue_as_guest(page)
-            return await self._scrape_case(page, bb, case_number)
+        or the numbers run out, probing and downloading in the SAME session so
+        there's no fresh session (or re-search) per case. The session is
+        recycled every _RECYCLE_SESSION_EVERY downloaded cases to keep its
+        cumulative get_downloads() zip small. Sharing a plain iterator between
+        workers is safe: next() has no await point."""
+        while self._claimed < self.max_cases:
+            bb = self.browser.new_browser_base()
+            async with bb as (_session, page):
+                await self._continue_as_guest(page)
+                downloaded = 0
+                for case_number in case_iter:
+                    if self._claimed >= self.max_cases:
+                        return  # quota already claimed (by any worker)
+                    self._attempted += 1
+                    try:
+                        print(f"[{case_number}] checking for documents…")
+                        docs, html, pages = await self._search(page, case_number)
+                    except Exception as exc:  # one bad case must not kill the sweep
+                        print(f"[{case_number}] error, skipping: {exc!r}")
+                        continue
+                    if not docs:
+                        print(f"[{case_number}] no documents")
+                        continue
+                    # Claim a slot *before* the expensive download-scrape so no
+                    # worker downloads a case beyond the quota.
+                    if self._claimed >= self.max_cases:
+                        return
+                    self._claimed += 1
+                    print(f"[{case_number}] found documents — downloading")
+                    try:
+                        case = await self._scrape_case(
+                            page, bb, case_number, docs, html, pages
+                        )
+                    except Exception as exc:
+                        print(f"[{case_number}] error, skipping: {exc!r}")
+                        self._claimed -= 1  # slot didn't pan out; free it
+                        continue
+                    if case is None:
+                        self._claimed -= 1
+                        continue
+                    self._scraped += 1
+                    await insert_case(case)
+                    downloaded += 1
+                    if downloaded >= _RECYCLE_SESSION_EVERY:
+                        break  # recycle the session to bound its download zip
+                else:
+                    return  # case_iter exhausted
 
     def _target_case_numbers(self) -> Iterable[str]:
         return self.case_numbers or generate_case_numbers(self.from_date, self.to_date)
@@ -259,14 +256,16 @@ class LosAngelesScraper(TrialScraper):
             return await attempt()
 
     async def _scrape_case(
-        self, page: Page, bb: BrowserBase, case_number: str
+        self,
+        page: Page,
+        bb: BrowserBase,
+        case_number: str,
+        docs: list[dict[str, str]],
+        html: str,
+        pages: list[int],
     ) -> ScrapedTrialCase | None:
-        docs, html, pages = await self._search(page, case_number)
-        if not docs:
-            print(f"[{case_number}] no documents found this time — skipping")
-            return None  # case not found or has no imaged documents
-        # html is the fetched page-1 results HTML; it carries the case metadata.
-
+        # docs/html/pages come from the probe search in this same session — no
+        # re-search. html is the page-1 results HTML; it carries case metadata.
         docs = await _collect_all_documents(page, docs, self.max_docs, pages)
         selected = docs[: self.max_docs]
         print(

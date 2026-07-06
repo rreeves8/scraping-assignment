@@ -1,2 +1,5 @@
 .env
 __pycache__/
+
+cases.json
+cases.json.tmp

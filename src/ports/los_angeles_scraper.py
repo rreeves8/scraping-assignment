@@ -22,6 +22,7 @@ import re
 import zipfile
 from collections.abc import Iterable, Iterator
 from datetime import date, datetime
+from html import unescape
 from urllib.parse import quote
 
 from playwright.async_api import Error as PlaywrightError
@@ -108,7 +109,7 @@ _OPINION_HINTS = ("opinion", "ruling", "order", "judgment", "minute order")
 # Global ceiling on captcha-gated downloads in flight at once, across every
 # worker and case. Without it, a big case (up to 50 docs) times LA_CONCURRENCY
 # sessions opens hundreds of simultaneous previews and melts down.
-_MAX_CONCURRENT_DOWNLOADS = 16
+_MAX_CONCURRENT_DOWNLOADS = 24
 
 
 class LosAngelesScraper(TrialScraper):
@@ -471,7 +472,8 @@ def _is_opinion(description: str) -> bool:
 def _case_meta(html: str) -> dict[str, str | None]:
     def field(label: str) -> str | None:
         m = re.search(rf"{label}:\s*</b>\s*([^<]+?)\s*<br", html)
-        return m.group(1).strip() if m else None
+        # Read from raw HTML, so decode entities (e.g. &amp; -> &).
+        return unescape(m.group(1).strip()) if m else None
 
     return {
         "case_title": field("Case Title"),

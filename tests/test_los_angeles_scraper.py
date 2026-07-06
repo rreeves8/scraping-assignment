@@ -82,13 +82,13 @@ def test_is_opinion():
 def test_case_meta():
     html = (
         "<b>Case Number: </b> 19STCV12345 <br>"
-        "<b>Case Title: </b> MATTHEW SHERMAN, ET AL. VS GEORGE BARNETT <br>"
+        "<b>Case Title: </b> SHERMAN VS MICHELMAN &amp; ROBINSON <br>"
         "<b>Case Type: </b> Motor Vehicle - Personal Injury <br>"
         "<b>Filing Date: </b> 4/9/2019 <br>"
     )
     meta = _case_meta(html)
     title, case_type = meta["case_title"], meta["case_type"]
-    assert title is not None and title.startswith("MATTHEW SHERMAN")
+    assert title == "SHERMAN VS MICHELMAN & ROBINSON"  # &amp; decoded
     assert meta["filing_date"] == "4/9/2019"
     assert case_type is not None and "Motor Vehicle" in case_type
 

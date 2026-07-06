@@ -1,4 +1,5 @@
 import asyncio
+import time
 from typing import Any
 
 import httpx
@@ -30,6 +31,10 @@ class BrowserBase:
         self._bb_session: Session | None = None
         self._http: httpx.AsyncClient | None = None
         self._began: dict[str, str] = {}  # download guid -> suggested filename
+        # Setup phase timings (seconds), filled by __aenter__ so the worker can
+        # log where its startup time went (429 backoff shows up in create).
+        self.create_secs = 0.0
+        self.connect_secs = 0.0
         # Filenames the browser reported fully transferred (CDP download
         # events) — once a name lands here its tab can close without
         # truncating the PDF, and the file is (about to be) in storage.
@@ -38,11 +43,14 @@ class BrowserBase:
     async def __aenter__(self) -> tuple[Session, Page]:
         await self._semaphore.acquire()
         try:
+            t0 = time.monotonic()
             self._bb_session = await self._create_session()
+            self.create_secs = time.monotonic() - t0
             self._pw = await async_playwright().start()
             self._browser = await self._pw.chromium.connect_over_cdp(
                 self._bb_session.connect_url
             )
+            self.connect_secs = time.monotonic() - t0 - self.create_secs
             # Route browser downloads into Browserbase storage so they can be
             # pulled back with the downloads API. downloadPath must be
             # "downloads"; eventsEnabled feeds the completion tracking below.

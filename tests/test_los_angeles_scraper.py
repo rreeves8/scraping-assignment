@@ -72,33 +72,37 @@ def test_is_complete_pdf():
 
 
 def test_download_pool_resubmits_failed_doc():
-    """A doc whose job resolves None (preview never started, bad capture, …)
-    is resubmitted once and can succeed on the second pass."""
+    """A doc whose job resolves to a failure reason (preview never started,
+    bad capture, …) is resubmitted up to twice; a doc that fails every attempt
+    is reported with its last reason."""
 
     async def run():
         scraper = LosAngelesScraper(
             date(2019, 12, 31), date(2019, 1, 1), cast(BrowserBaseFactory, None)
         )
         pdf = b"%PDF ok %%EOF"
-        failures = {"2": 1}  # docId -> jobs that resolve None before succeeding
+        # docId -> jobs that resolve with a reason before succeeding.
+        # Doc 2 recovers on its second attempt; doc 3 exhausts all three.
+        failures = {"2": 1, "3": 3}
 
         async def consumer():
             while True:
                 doc, fut = await scraper._dl_queue.get()
                 if failures.get(doc["docId"], 0) > 0:
                     failures[doc["docId"]] -= 1
-                    fut.set_result(None)
+                    fut.set_result("captcha unsolved")
                 else:
                     fut.set_result(pdf)
 
         task = asyncio.create_task(consumer())
-        selected = [_row("1"), _row("2")]
+        selected = [_row("1"), _row("2"), _row("3")]
         try:
-            got = await scraper._download_documents("X", selected)
+            got, why = await scraper._download_documents("X", selected)
         finally:
             task.cancel()
         assert got == {"1": pdf, "2": pdf}  # doc 2 recovered on resubmission
-        assert failures["2"] == 0
+        assert why["3"] == "captcha unsolved"  # doc 3 failed all 3 attempts
+        assert failures == {"2": 0, "3": 0}  # every attempt was consumed
 
     asyncio.run(run())
 
